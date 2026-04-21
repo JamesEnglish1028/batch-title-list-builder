@@ -106,6 +106,53 @@ const chunkArray = (values, size) => {
   return chunks;
 };
 
+const toPositiveInteger = (value) => {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) return null;
+  return parsed;
+};
+
+const resolveCollectionApiId = (collection) => {
+  const candidates = [
+    collection?.collection_id,
+    collection?.collectionId,
+    collection?.collection?.id,
+    collection?.settings?.collection_id,
+    collection?.settings?.collectionId,
+    collection?.id,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = toPositiveInteger(candidate);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+};
+
+const resolveSelectedCollectionApiIds = (allCollections, selectedUiIds) => {
+  const selectedSet = new Set(selectedUiIds.map((value) => String(value)));
+  const resolved = [];
+
+  allCollections.forEach((collection) => {
+    if (!selectedSet.has(String(collection.id))) return;
+    const apiId = resolveCollectionApiId(collection);
+    if (apiId !== null) {
+      resolved.push(apiId);
+    }
+  });
+
+  return Array.from(new Set(resolved));
+};
+
+const shouldRetryWithoutCollections = (message) => {
+  const lowered = String(message || "").toLowerCase();
+  return (
+    lowered.includes("specified collection does not exist") ||
+    lowered.includes("collection does not exist")
+  );
+};
+
 const DEFAULT_REDIRECT = "/admin/web";
 
 function App() {
@@ -122,7 +169,7 @@ function App() {
   const [collections, setCollections] = useState([]);
   const [selectedCollections, setSelectedCollections] = useState([]);
   const [collectionsStatus, setCollectionsStatus] = useState(STATUS_IDLE);
-  const [collectionsMessage, setCollectionsMessage] = useState("");
+  const [, setCollectionsMessage] = useState("");
   const [customLists, setCustomLists] = useState([]);
   const [customListsStatus, setCustomListsStatus] = useState(STATUS_IDLE);
   const [customListsMessage, setCustomListsMessage] = useState("");
@@ -144,6 +191,7 @@ function App() {
 
   const [createStatus, setCreateStatus] = useState(STATUS_IDLE);
   const [createMessage, setCreateMessage] = useState("");
+  const [createNotice, setCreateNotice] = useState("");
   const [createdListId, setCreatedListId] = useState("");
   const [createDebug, setCreateDebug] = useState(null);
   const [validationIssues, setValidationIssues] = useState(null);
@@ -241,12 +289,17 @@ function App() {
       }
 
       const data = await response.json();
-      const nextCollections = (data.collections || []).map((collection) => ({
-        id: collection.id,
-        name: collection.name,
-        protocol: collection.protocol,
-        libraries: collection.libraries || [],
-      }));
+      const nextCollections = (data.collections || []).map((collection, index) => {
+        const fallbackId = `collection-${index + 1}`;
+        return {
+          ...collection,
+          id: String(collection.id ?? collection.collection_id ?? fallbackId),
+          apiId: resolveCollectionApiId(collection),
+          name: collection.name || "Unnamed collection",
+          protocol: collection.protocol || "unknown",
+          libraries: collection.libraries || [],
+        };
+      });
 
       setCollections(nextCollections);
       if (!exportCollectionId && nextCollections.length > 0) {
@@ -299,7 +352,7 @@ function App() {
         method: "GET",
         credentials: "include",
       });
-    } catch (_error) {
+    } catch {
       // ignore network errors; still clear local state
     }
 
@@ -312,6 +365,7 @@ function App() {
     setFileName("");
     setParseMessage("");
     setCreateMessage("");
+    setCreateNotice("");
     setCreatedListId("");
     setCreateDebug(null);
     setPage(PAGE_LOGIN);
@@ -325,7 +379,7 @@ function App() {
     try {
       const parsed = new URL(href);
       return `${base}${parsed.pathname}${parsed.search}`;
-    } catch (_error) {
+    } catch {
       return href;
     }
   };
@@ -550,7 +604,7 @@ function App() {
       let entries = [];
       try {
         entries = await fetchOpdsEntries(safeFeedUrl, []);
-      } catch (_error) {
+      } catch {
         const resolvedUrl = await resolveCollectionFeedUrl(collection.name);
         setExportFeedUrl(resolvedUrl);
         entries = await fetchOpdsEntries(resolvedUrl, []);
@@ -714,6 +768,7 @@ function App() {
     event.preventDefault();
     setCreateStatus(STATUS_WORKING);
     setCreateMessage("");
+    setCreateNotice("");
     setCreatedListId("");
     setValidationIssues(null);
     setChunkProgress(null);
@@ -760,48 +815,85 @@ function App() {
       }
 
       const entriesPayload = uniqueIds.map((id) => ({ id }));
+      const collectionIdsPayload = resolveSelectedCollectionApiIds(
+        collections,
+        selectedCollections
+      );
+      let activeCollectionIdsPayload = collectionIdsPayload;
       setCreateDebug({
         count: entriesPayload.length,
         sample: entriesPayload.slice(0, 5).map((item) => item.id),
+        selectedCollections,
+        collectionIdsPayload: activeCollectionIdsPayload,
       });
 
-      const createPayload = new URLSearchParams();
-      createPayload.set("name", listName.trim());
-      createPayload.set("entries", JSON.stringify([]));
-      createPayload.set("collections", JSON.stringify(selectedCollections));
+      const submitCreate = async (collectionsForRequest) => {
+        const createPayload = new URLSearchParams();
+        createPayload.set("name", listName.trim());
+        createPayload.set("entries", JSON.stringify([]));
+        createPayload.set("collections", JSON.stringify(collectionsForRequest));
 
-      const response = await fetch(`${apiBase}/admin/custom_lists`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "X-CSRF-Token": csrfToken,
-        },
-        credentials: "include",
-        body: createPayload.toString(),
-      });
+        const response = await fetch(`${apiBase}/admin/custom_lists`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-CSRF-Token": csrfToken,
+          },
+          credentials: "include",
+          body: createPayload.toString(),
+        });
 
-      if (!response.ok) {
-        let errorMessage = `Create list failed with ${response.status}`;
-        const contentType = response.headers.get("content-type") || "";
-        if (
-          contentType.includes("application/json") ||
-          contentType.includes("application/api-problem+json")
-        ) {
-          const json = await response.json();
-          errorMessage = json.detail || json.title || errorMessage;
-        } else {
-          const text = await response.text();
-          if (text) {
-            errorMessage = `${errorMessage}. ${text.slice(0, 300)}`.trim();
+        if (!response.ok) {
+          let errorMessage = `Create list failed with ${response.status}`;
+          const contentType = response.headers.get("content-type") || "";
+          if (
+            contentType.includes("application/json") ||
+            contentType.includes("application/api-problem+json")
+          ) {
+            const json = await response.json();
+            errorMessage = json.detail || json.title || errorMessage;
+          } else {
+            const text = await response.text();
+            if (text) {
+              errorMessage = `${errorMessage}. ${text.slice(0, 300)}`.trim();
+            }
           }
+          if (errorMessage.toLowerCase().includes("already has a custom list")) {
+            setListExistsError(true);
+          }
+          throw new Error(errorMessage);
         }
-        if (errorMessage.toLowerCase().includes("already has a custom list")) {
-          setListExistsError(true);
+
+        return response.text();
+      };
+
+      let listId = "";
+      try {
+        listId = await submitCreate(activeCollectionIdsPayload);
+      } catch (createError) {
+        if (
+          activeCollectionIdsPayload.length > 0 &&
+          shouldRetryWithoutCollections(createError.message)
+        ) {
+          activeCollectionIdsPayload = [];
+          setCreateDebug((current) =>
+            current
+              ? {
+                  ...current,
+                  collectionIdsPayload: activeCollectionIdsPayload,
+                  collectionFallbackApplied: true,
+                }
+              : current
+          );
+          setCreateNotice(
+            "Selected collection IDs were not accepted by Palace. Retried with no explicit collection mapping."
+          );
+          listId = await submitCreate(activeCollectionIdsPayload);
+        } else {
+          throw createError;
         }
-        throw new Error(errorMessage);
       }
 
-      const listId = await response.text();
       setCreatedListId(listId);
 
       const chunks = chunkArray(entriesPayload, CHUNK_SIZE);
@@ -811,7 +903,7 @@ function App() {
         const updatePayload = new URLSearchParams();
         updatePayload.set("name", listName.trim());
         updatePayload.set("entries", JSON.stringify(chunk));
-        updatePayload.set("collections", JSON.stringify(selectedCollections));
+        updatePayload.set("collections", JSON.stringify(activeCollectionIdsPayload));
 
         const updateResponse = await fetch(
           `${apiBase}/admin/custom_list/${listId}`,
@@ -861,6 +953,7 @@ function App() {
     event.preventDefault();
     setCreateStatus(STATUS_WORKING);
     setCreateMessage("");
+    setCreateNotice("");
     setChunkProgress(null);
 
     try {
@@ -900,9 +993,16 @@ function App() {
       }
 
       const entriesPayload = uniqueIds.map((id) => ({ id }));
+      const collectionIdsPayload = resolveSelectedCollectionApiIds(
+        collections,
+        selectedCollections
+      );
+      let activeCollectionIdsPayload = collectionIdsPayload;
       setCreateDebug({
         count: entriesPayload.length,
         sample: entriesPayload.slice(0, 5).map((item) => item.id),
+        selectedCollections,
+        collectionIdsPayload: activeCollectionIdsPayload,
       });
 
       const chunks = chunkArray(entriesPayload, CHUNK_SIZE);
@@ -915,7 +1015,7 @@ function App() {
         updatePayload.set("name", listName.trim());
         updatePayload.set("entries", JSON.stringify(chunk));
         updatePayload.set("deletedEntries", JSON.stringify([]));
-        updatePayload.set("collections", JSON.stringify(selectedCollections));
+        updatePayload.set("collections", JSON.stringify(activeCollectionIdsPayload));
 
         const updateResponse = await fetch(
           `${apiBase}/admin/custom_list/${existingListId.trim()}`,
@@ -945,7 +1045,50 @@ function App() {
               errorMessage = `${errorMessage}. ${text.slice(0, 300)}`.trim();
             }
           }
-          throw new Error(errorMessage);
+          if (
+            activeCollectionIdsPayload.length > 0 &&
+            shouldRetryWithoutCollections(errorMessage)
+          ) {
+            activeCollectionIdsPayload = [];
+            setCreateDebug((current) =>
+              current
+                ? {
+                    ...current,
+                    collectionIdsPayload: activeCollectionIdsPayload,
+                    collectionFallbackApplied: true,
+                  }
+                : current
+            );
+            setCreateNotice(
+              "Selected collection IDs were not accepted by Palace. Retried with no explicit collection mapping."
+            );
+
+            const retryPayload = new URLSearchParams();
+            retryPayload.set("id", existingListId.trim());
+            retryPayload.set("name", listName.trim());
+            retryPayload.set("entries", JSON.stringify(chunk));
+            retryPayload.set("deletedEntries", JSON.stringify([]));
+            retryPayload.set("collections", JSON.stringify(activeCollectionIdsPayload));
+
+            const retryResponse = await fetch(
+              `${apiBase}/admin/custom_list/${existingListId.trim()}`,
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "X-CSRF-Token": csrfToken,
+                },
+                credentials: "include",
+                body: retryPayload.toString(),
+              }
+            );
+
+            if (!retryResponse.ok) {
+              throw new Error(errorMessage);
+            }
+          } else {
+            throw new Error(errorMessage);
+          }
         }
 
         setChunkProgress({ total: chunks.length, completed: i + 1 });
@@ -965,6 +1108,7 @@ function App() {
     event.preventDefault();
     setCreateStatus(STATUS_WORKING);
     setCreateMessage("");
+    setCreateNotice("");
     setChunkProgress(null);
 
     try {
@@ -1007,9 +1151,16 @@ function App() {
       }
 
       const entriesPayload = uniqueIds.map((id) => ({ id }));
+      const collectionIdsPayload = resolveSelectedCollectionApiIds(
+        collections,
+        selectedCollections
+      );
+      let activeCollectionIdsPayload = collectionIdsPayload;
       setCreateDebug({
         count: entriesPayload.length,
         sample: entriesPayload.slice(0, 5).map((item) => item.id),
+        selectedCollections,
+        collectionIdsPayload: activeCollectionIdsPayload,
       });
 
       const selectedList = customLists.find(
@@ -1028,7 +1179,7 @@ function App() {
         updatePayload.set("name", updateName);
         updatePayload.set("entries", JSON.stringify(chunk));
         updatePayload.set("deletedEntries", JSON.stringify([]));
-        updatePayload.set("collections", JSON.stringify(selectedCollections));
+        updatePayload.set("collections", JSON.stringify(activeCollectionIdsPayload));
 
         const updateResponse = await fetch(
           `${apiBase}/admin/custom_list/${selectedUpdateListId}`,
@@ -1058,7 +1209,50 @@ function App() {
               errorMessage = `${errorMessage}. ${text.slice(0, 300)}`.trim();
             }
           }
-          throw new Error(errorMessage);
+          if (
+            activeCollectionIdsPayload.length > 0 &&
+            shouldRetryWithoutCollections(errorMessage)
+          ) {
+            activeCollectionIdsPayload = [];
+            setCreateDebug((current) =>
+              current
+                ? {
+                    ...current,
+                    collectionIdsPayload: activeCollectionIdsPayload,
+                    collectionFallbackApplied: true,
+                  }
+                : current
+            );
+            setCreateNotice(
+              "Selected collection IDs were not accepted by Palace. Retried with no explicit collection mapping."
+            );
+
+            const retryPayload = new URLSearchParams();
+            retryPayload.set("id", selectedUpdateListId);
+            retryPayload.set("name", updateName);
+            retryPayload.set("entries", JSON.stringify(chunk));
+            retryPayload.set("deletedEntries", JSON.stringify([]));
+            retryPayload.set("collections", JSON.stringify(activeCollectionIdsPayload));
+
+            const retryResponse = await fetch(
+              `${apiBase}/admin/custom_list/${selectedUpdateListId}`,
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "X-CSRF-Token": csrfToken,
+                },
+                credentials: "include",
+                body: retryPayload.toString(),
+              }
+            );
+
+            if (!retryResponse.ok) {
+              throw new Error(errorMessage);
+            }
+          } else {
+            throw new Error(errorMessage);
+          }
         }
 
         setChunkProgress({ total: chunks.length, completed: i + 1 });
@@ -1099,7 +1293,7 @@ function App() {
             <div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm text-slate-600">
               <p className="font-semibold">Default connection</p>
               <p className="mt-1">`/cm` (proxied to localhost:6500)</p>
-              <p className="mt-1">`/public` (proxied to localhost:8080)</p>
+              <p className="mt-1">`/public` (proxied to localhost:6500)</p>
               {adminEmail && (
                 <div className="mt-2 flex items-center justify-between gap-3 text-xs text-slate-500">
                   <span>Signed in as {adminEmail}</span>
@@ -1531,10 +1725,26 @@ function App() {
                       {chunkProgress.total}
                     </p>
                   )}
+                  {createDebug && (
+                    <p className="mt-1 text-xs text-slate-500">
+                      Collections submitted: {JSON.stringify(createDebug.collectionIdsPayload || [])}
+                    </p>
+                  )}
+                  {createNotice && createStatus !== STATUS_ERROR && (
+                    <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-800">
+                      {createNotice}
+                    </p>
+                  )}
                   {createStatus === STATUS_ERROR && createDebug && (
                     <div className="mt-2 text-xs text-rose-800">
                       <p>Entries sent: {createDebug.count}</p>
                       <p>Sample URNs: {createDebug.sample.join(", ")}</p>
+                      <p>
+                        Collection IDs sent: {JSON.stringify(createDebug.collectionIdsPayload || [])}
+                      </p>
+                      {createDebug.collectionFallbackApplied && (
+                        <p>Collection fallback applied: retried with []</p>
+                      )}
                     </div>
                   )}
                   {createdListId && (
@@ -1749,6 +1959,16 @@ function App() {
                       <p className="mt-1 text-xs text-slate-500">
                         Chunks processed: {chunkProgress.completed} /{" "}
                         {chunkProgress.total}
+                      </p>
+                    )}
+                    {createDebug && (
+                      <p className="mt-1 text-xs text-slate-500">
+                        Collections submitted: {JSON.stringify(createDebug.collectionIdsPayload || [])}
+                      </p>
+                    )}
+                    {createNotice && createStatus !== STATUS_ERROR && (
+                      <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-800">
+                        {createNotice}
                       </p>
                     )}
                   </div>

@@ -18,7 +18,7 @@ export default defineConfig({
         secure: false,
       },
       "/public": {
-        target: "http://localhost:8080",
+        target: "http://localhost:6500",
         changeOrigin: true,
         secure: false,
         rewrite: (path) => path.replace(/^\/public/, ""),

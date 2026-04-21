@@ -8,7 +8,7 @@ This is a React + Tailwind app that helps librarians create Palace Manager custo
 - Parses CSV or XLSX identifiers.
 - Creates a custom list via `POST /admin/custom_lists`.
 
-## Getting Started
+## Quick Start
 
 1. Install dependencies
 
@@ -16,13 +16,25 @@ This is a React + Tailwind app that helps librarians create Palace Manager custo
 npm install
 ```
 
-2. Run the dev server
+2. (Optional) Configure local endpoints
+
+Copy `.env.example` to `.env` and adjust values if needed:
+
+```
+VITE_API_BASE=/cm
+VITE_FEED_BASE=/public
+VITE_CHUNK_SIZE=10
+```
+
+3. Run the dev server
 
 ```bash
 npm run dev
 ```
 
-The Vite dev server proxies `/cm` to `http://localhost:6500` by default so cookies and CSRF work without CORS issues.
+The Vite dev server proxies `/cm` and `/public` to `http://localhost:6500` by default so cookies and CSRF work without CORS issues.
+
+Custom list writes are batched in groups of 10 publications per request because the backend only handles 10 at a time.
 
 ## Configuration Notes
 
